@@ -249,12 +249,15 @@ namespace Microsoft.Framework.ApplicationHost
             Exception innerException)
         {
 
-            var compilationException = innerException as CompilationException;
+            var compilationException = innerException as ICompilationException;
 
             if (compilationException != null)
             {
-                throw new InvalidOperationException(
-                    string.Join(Environment.NewLine, compilationException.Errors));
+                var messages = from failure in compilationException.CompilationFailures
+                               from item in failure.Messages
+                               select item.Message;
+
+                throw new InvalidOperationException(string.Join(Environment.NewLine, messages));
             }
 
             if (host.Project.Commands.Any())

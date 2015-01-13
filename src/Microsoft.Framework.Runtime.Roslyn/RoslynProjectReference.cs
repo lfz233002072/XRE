@@ -98,7 +98,7 @@ namespace Microsoft.Framework.Runtime.Roslyn
                 if (!emitResult.Success ||
                     diagnostics.Any(RoslynDiagnosticUtilities.IsError))
                 {
-                    throw new RoslynCompilationException(diagnostics);
+                    throw new RoslynCompilationException(Name, diagnostics);
                 }
 
                 Assembly assembly = null;
