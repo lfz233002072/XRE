@@ -15,6 +15,7 @@ using Microsoft.Framework.PackageManager.Restore.NuGet;
 using Microsoft.Framework.Runtime;
 using Newtonsoft.Json.Linq;
 using NuGet;
+using Microsoft.Framework.Runtime.DependencyManagement;
 
 namespace Microsoft.Framework.PackageManager
 {
@@ -145,11 +146,17 @@ namespace Microsoft.Framework.PackageManager
             var sw = new Stopwatch();
             sw.Start();
 
+            var projectFolder = Path.GetDirectoryName(projectJsonPath);
+            var projectLockFilePath = Path.Combine(projectFolder, LockFileFormat.LockFileName);
+
             Runtime.Project project;
             if (!Runtime.Project.TryGetProject(projectJsonPath, out project))
             {
                 throw new Exception("TODO: project.json parse error");
             }
+
+            var lockFile = await ReadLockFile(projectLockFilePath);
+            var isLocked = lockFile?.Islocked ?? false;
 
             Func<string, string> getVariable = key =>
             {
@@ -186,45 +193,77 @@ namespace Microsoft.Framework.PackageManager
 
             AddRemoteProvidersFromSources(remoteProviders, effectiveSources);
 
-            foreach (var configuration in project.GetTargetFrameworks())
-            {
-                var context = new RestoreContext
-                {
-                    FrameworkName = configuration.FrameworkName,
-                    ProjectLibraryProviders = projectProviders,
-                    LocalLibraryProviders = localProviders,
-                    RemoteLibraryProviders = remoteProviders,
-                };
-                contexts.Add(context);
-            }
+            var tasks = new List<Task<GraphNode>>();
 
-            if (!contexts.Any())
+            if (isLocked)
             {
-                contexts.Add(new RestoreContext
+                Reports.Information.WriteLine(string.Format("Following lock file {0}", projectLockFilePath.White().Bold()));
+
+                var context = new RestoreContext
                 {
                     FrameworkName = ApplicationEnvironment.RuntimeFramework,
                     ProjectLibraryProviders = projectProviders,
                     LocalLibraryProviders = localProviders,
                     RemoteLibraryProviders = remoteProviders,
-                });
-            }
-
-            var tasks = new List<Task<GraphNode>>();
-
-            foreach (var context in contexts)
-            {
-                var projectLibrary = new LibraryRange
-                {
-                    Name = project.Name,
-                    VersionRange = new SemanticVersionRange(project.Version)
                 };
 
-                tasks.Add(restoreOperations.CreateGraphNode(context, projectLibrary, _ => true));
+                contexts.Add(context);
+
+                foreach (var lockFileLibrary in lockFile.Libraries)
+                {
+                    var projectLibrary = new LibraryRange
+                    {
+                        Name = lockFileLibrary.Name,
+                        VersionRange = new SemanticVersionRange
+                        {
+                            MinVersion = lockFileLibrary.Version,
+                            MaxVersion = lockFileLibrary.Version,
+                            IsMaxInclusive = true,
+                            VersionFloatBehavior = SemanticVersionFloatBehavior.None,
+                        }
+                    };
+                    tasks.Add(restoreOperations.CreateGraphNode(context, projectLibrary, _ => false));
+                }
+            }
+            else
+            {
+                foreach (var configuration in project.GetTargetFrameworks())
+                {
+                    var context = new RestoreContext
+                    {
+                        FrameworkName = configuration.FrameworkName,
+                        ProjectLibraryProviders = projectProviders,
+                        LocalLibraryProviders = localProviders,
+                        RemoteLibraryProviders = remoteProviders,
+                    };
+                    contexts.Add(context);
+                }
+
+                if (!contexts.Any())
+                {
+                    contexts.Add(new RestoreContext
+                    {
+                        FrameworkName = ApplicationEnvironment.RuntimeFramework,
+                        ProjectLibraryProviders = projectProviders,
+                        LocalLibraryProviders = localProviders,
+                        RemoteLibraryProviders = remoteProviders,
+                    });
+                }
+
+                foreach (var context in contexts)
+                {
+                    var projectLibrary = new LibraryRange
+                    {
+                        Name = project.Name,
+                        VersionRange = new SemanticVersionRange(project.Version)
+                    };
+
+                    tasks.Add(restoreOperations.CreateGraphNode(context, projectLibrary, _ => true));
+                }
             }
             var graphs = await Task.WhenAll(tasks);
 
-            Reports.Information.WriteLine(string.Format("{0}, {1}ms elapsed", "Resolving complete".Green(), sw.ElapsedMilliseconds));
-
+            var graphItems = new List<GraphItem>();
             var installItems = new List<GraphItem>();
             var missingItems = new HashSet<LibraryRange>();
 
@@ -263,15 +302,27 @@ namespace Microsoft.Framework.PackageManager
                 }
 
                 var isRemote = remoteProviders.Contains(node.Item.Match.Provider);
-                var isAdded = installItems.Any(item => item.Match.Library == node.Item.Match.Library);
+                var isInstallItem = installItems.Any(item => item.Match.Library == node.Item.Match.Library);
 
-                if (!isAdded && isRemote)
+                if (!isInstallItem && isRemote)
                 {
                     installItems.Add(node.Item);
+                }
+
+                var isGraphItem = graphItems.Any(item => item.Match.Library == node.Item.Match.Library);
+                if (!isGraphItem)
+                {
+                    graphItems.Add(node.Item);
                 }
             });
 
             await InstallPackages(installItems, packagesDirectory, packageFilter: (library, nupkgSHA) => true);
+
+            if (success && !isLocked)
+            {
+                Reports.Information.WriteLine(string.Format("Writing lock file {0}", projectLockFilePath.White().Bold()));
+                await WriteLockFile(projectLockFilePath, graphItems);
+            }
 
             if (!ScriptExecutor.Execute(project, "postrestore", getVariable))
             {
@@ -351,8 +402,8 @@ namespace Microsoft.Framework.PackageManager
                 var item = resolvedItems[i];
                 var library = libsToRestore[i];
 
-                if (item == null || 
-                    item.Match == null || 
+                if (item == null ||
+                    item.Match == null ||
                     item.Match.Library.Version != library.Version)
                 {
                     missingItems.Add(library);
@@ -421,6 +472,33 @@ namespace Microsoft.Framework.PackageManager
                 }
             }
         }
+
+        private Task<LockFile> ReadLockFile(string projectLockFilePath)
+        {
+            if (!File.Exists(projectLockFilePath))
+            {
+                return Task.FromResult(default(LockFile));
+            }
+            var lockFileFormat = new LockFileFormat();
+            return Task.FromResult(lockFileFormat.Read(projectLockFilePath));
+        }
+
+        private async Task WriteLockFile(string projectLockFilePath, List<GraphItem> graphItems)
+        {
+            var lockFile = new LockFile();
+            foreach (var item in graphItems.OrderBy(x => x.Match.Library, new LibraryComparer()))
+            {
+                var library = await item.Match.Provider.GetLockFileLibrary(item.Match);
+                if (library != null)
+                {
+                    lockFile.Libraries.Add(library);
+                }
+            }
+
+            var lockFileFormat = new LockFileFormat();
+            lockFileFormat.Write(projectLockFilePath, lockFile);
+        }
+
 
         private void AddRemoteProvidersFromSources(List<IWalkProvider> remoteProviders, List<PackageSource> effectiveSources)
         {
@@ -510,6 +588,34 @@ namespace Microsoft.Framework.PackageManager
         {
             path = FileSystem.GetFullPath(path);
             return new PhysicalFileSystem(path);
+        }
+
+        class LibraryComparer : IComparer<Library>
+        {
+            public int Compare(Library x, Library y)
+            {
+                int compare = string.Compare(x.Name, y.Name);
+                if (compare == 0)
+                {
+                    if (x.Version == null && y.Version == null)
+                    {
+                        // NOOP;
+                    }
+                    else if (x.Version == null)
+                    {
+                        compare = -1;
+                    }
+                    else if (y.Version == null)
+                    {
+                        compare = 1;
+                    }
+                    else
+                    {
+                        compare = x.Version.CompareTo(y.Version);
+                    }
+                }
+                return compare;
+            }
         }
     }
 }
