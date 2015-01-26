@@ -59,6 +59,12 @@ namespace Microsoft.Framework.PackageManager
                     CommandOptionType.SingleValue);
                 var optNoCache = c.Option("--no-cache", "Do not use local cache", CommandOptionType.NoValue);
                 var optPackageFolder = c.Option("--packages", "Path to restore packages", CommandOptionType.SingleValue);
+                var optLock = c.Option("--lock",
+                    "Creates dependencies file with locked property set to true. Overwrites file if it exists.",
+                    CommandOptionType.NoValue);
+                var optUnlock = c.Option("--unlock",
+                    "Creates dependencies file with locked property set to false. Overwrites file if it exists.",
+                    CommandOptionType.NoValue);
                 var optQuiet = c.Option("--quiet", "Do not show output such as HTTP request/cache information",
                     CommandOptionType.NoValue);
                 var optIgnoreFailedSources = c.Option("--ignore-failed-sources",
@@ -75,6 +81,8 @@ namespace Microsoft.Framework.PackageManager
                     command.Sources = optSource.Values;
                     command.FallbackSources = optFallbackSource.Values;
                     command.NoCache = optNoCache.HasValue();
+                    command.Lock = optLock.HasValue();
+                    command.Unlock = optUnlock.HasValue();
                     command.PackageFolder = optPackageFolder.Value();
                     command.IgnoreFailedSources = optIgnoreFailedSources.HasValue();
 
